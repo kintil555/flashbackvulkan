@@ -1,28 +1,40 @@
 package com.moulberry.flashback.exporting;
 
-import com.mojang.blaze3d.opengl.GlDevice;
-import com.mojang.blaze3d.opengl.GlStateManager;
-import com.mojang.blaze3d.opengl.GlTexture;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
 import org.jetbrains.annotations.Nullable;
-import org.lwjgl.opengl.GL11;
-import org.lwjgl.opengl.GL30;
-import org.lwjgl.opengl.GL30C;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 
+/**
+ * SaveableFramebuffer - Versi kompatibel Vulkan/OpenGL
+ *
+ * Perubahan dari versi asli:
+ * - DIHAPUS: GL30C.glGenBuffers(), glBindBuffer(), glReadPixels(), glMapBuffer()
+ *   (semua ini OpenGL-only, tidak kompatibel dengan VulkanMod)
+ *
+ * - DIGANTI dengan:
+ *   - GpuBuffer (abstraction layer Minecraft 1.21+)
+ *   - commandEncoder.copyTextureToBuffer() untuk download GPU → CPU
+ *   - GpuBuffer.slice().map() untuk baca data
+ */
 public class SaveableFramebuffer implements AutoCloseable {
-    private int pboId;
+
+    private @Nullable GpuBuffer downloadBuffer;
+    private int allocatedWidth = -1;
+    private int allocatedHeight = -1;
+
     public @Nullable FloatBuffer audioBuffer;
 
     private boolean isDownloading = false;
 
     public SaveableFramebuffer() {
-        this.pboId = -1;
+        this.downloadBuffer = null;
     }
 
     public void startDownload(GpuTexture gpuTexture, int width, int height) {
@@ -31,26 +43,30 @@ public class SaveableFramebuffer implements AutoCloseable {
         }
         this.isDownloading = true;
 
-        if (this.pboId == -1) {
-            this.pboId = GL30C.glGenBuffers();
+        int requiredSize = width * height * 4; // RGBA = 4 bytes per pixel
 
-            GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
-            GL30C.glBufferData(GL30C.GL_PIXEL_PACK_BUFFER, (long) width * height * 4, GL30C.GL_STREAM_READ);
-            GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, 0);
+        // Buat ulang buffer hanya kalau ukuran berubah
+        if (this.downloadBuffer == null || this.allocatedWidth != width || this.allocatedHeight != height) {
+            if (this.downloadBuffer != null) {
+                this.downloadBuffer.close();
+            }
+
+            // GpuBuffer.Usage.DOWNLOAD = buffer untuk transfer GPU ke CPU
+            // Di OpenGL ini jadi PBO, di Vulkan ini jadi staging buffer — otomatis
+            this.downloadBuffer = RenderSystem.getDevice().createBuffer(
+                () -> "flashback:saveable_framebuffer",
+                GpuBuffer.Usage.DOWNLOAD,
+                requiredSize
+            );
+
+            this.allocatedWidth = width;
+            this.allocatedHeight = height;
         }
 
-        int fbo = ((GlTexture)gpuTexture).getFbo(((GlDevice)RenderSystem.getDevice()).directStateAccess(), null);
-        GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo);
-
-        GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
-        GlStateManager._pixelStore(GL11.GL_PACK_ALIGNMENT, 1);
-        GlStateManager._pixelStore(GL11.GL_PACK_ROW_LENGTH, 0);
-        GlStateManager._pixelStore(GL11.GL_PACK_SKIP_PIXELS, 0);
-        GlStateManager._pixelStore(GL11.GL_PACK_SKIP_ROWS, 0);
-        GL30C.glReadPixels(0, 0, width, height, GL30C.GL_RGBA, GL30C.GL_UNSIGNED_BYTE, 0);
-        GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, 0);
-
-        GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
+        // Copy texture dari GPU ke buffer — tidak ada GL call langsung
+        // VulkanMod handle ini via vkCmdCopyImageToBuffer secara internal
+        RenderSystem.getDevice().createCommandEncoder()
+            .copyTextureToBuffer(gpuTexture, this.downloadBuffer, 0, width, height);
     }
 
     public NativeImage finishDownload(int width, int height) {
@@ -59,29 +75,38 @@ public class SaveableFramebuffer implements AutoCloseable {
         }
         this.isDownloading = false;
 
-        NativeImage nativeImage = new NativeImage(NativeImage.Format.RGBA, width, height, false);
-
-        GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, this.pboId);
-        ByteBuffer buffer = GL30C.glMapBuffer(GL30C.GL_PIXEL_PACK_BUFFER, GL30C.GL_READ_ONLY);
-
-        if (buffer == null) {
-            throw new IllegalStateException("OpenGL error occurred while mapping buffer");
+        if (this.downloadBuffer == null) {
+            throw new IllegalStateException("Download buffer is null");
         }
 
-        // Copy bytes
-        MemoryUtil.memCopy(MemoryUtil.memAddress(buffer), nativeImage.pixels, nativeImage.size);
+        NativeImage nativeImage = new NativeImage(NativeImage.Format.RGBA, width, height, false);
 
-        GL30C.glUnmapBuffer(GL30C.GL_PIXEL_PACK_BUFFER);
-        GL30C.glBindBuffer(GL30C.GL_PIXEL_PACK_BUFFER, 0);
+        // Map buffer untuk baca dari CPU — bukan glMapBuffer langsung
+        GpuBufferSlice slice = this.downloadBuffer.slice(0, width * height * 4);
+        ByteBuffer mapped = slice.map();
+
+        if (mapped == null) {
+            nativeImage.close();
+            throw new IllegalStateException("Failed to map download buffer");
+        }
+
+        try {
+            MemoryUtil.memCopy(MemoryUtil.memAddress(mapped), nativeImage.pixels, nativeImage.size);
+        } finally {
+            slice.unmap();
+        }
 
         return nativeImage;
     }
 
+    @Override
     public void close() {
-        if (this.pboId != -1) {
-            GL30C.glDeleteBuffers(this.pboId);
-            this.pboId = -1;
+        if (this.downloadBuffer != null) {
+            this.downloadBuffer.close();
+            this.downloadBuffer = null;
         }
+        this.allocatedWidth = -1;
+        this.allocatedHeight = -1;
     }
 
 }
