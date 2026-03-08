@@ -1,0 +1,59 @@
+name: Build Mod
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'microsoft'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: false
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x gradlew
+
+      # Validasi folder deps/ ada (imgui-binding & imgui-natives)
+      - name: Check local deps exist
+        run: |
+          if [ ! -f "deps/imgui-binding-1.90.0.jar" ]; then
+            echo "❌ ERROR: deps/imgui-binding-1.90.0.jar not found!"
+            echo "Pastikan folder deps/ sudah di-commit ke repository."
+            exit 1
+          fi
+          if [ ! -f "deps/imgui-natives.jar" ]; then
+            echo "❌ ERROR: deps/imgui-natives.jar not found!"
+            echo "Pastikan folder deps/ sudah di-commit ke repository."
+            exit 1
+          fi
+          echo "✅ Local deps found!"
+
+      - name: Build with Gradle
+        run: ./gradlew build --stacktrace
+
+      # Upload hasil remapJar (jar final yang sudah di-remap + shadow)
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashback-mod-${{ github.sha }}
+          path: |
+            build/libs/*.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: error
