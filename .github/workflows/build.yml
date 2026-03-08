@@ -29,25 +29,46 @@ jobs:
       - name: Grant execute permission to gradlew
         run: chmod +x gradlew
 
-      # Validasi folder deps/ ada (imgui-binding & imgui-natives)
+      # Tambah Fabric maven ke init script supaya Gradle bisa resolve fabric-loom SNAPSHOT
+      # Ini fix untuk error "Could not resolve fabric-loom:fabric-loom.gradle.plugin:1.14-SNAPSHOT"
+      - name: Add Fabric maven to Gradle init script
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/fabric-loom.gradle << 'EOF'
+          settingsEvaluated { settings ->
+              settings.pluginManagement {
+                  repositories {
+                      maven {
+                          name = "Fabric"
+                          url = "https://maven.fabricmc.net/"
+                      }
+                      gradlePluginPortal()
+                      mavenCentral()
+                  }
+              }
+          }
+          EOF
+
       - name: Check local deps exist
         run: |
           if [ ! -f "deps/imgui-binding-1.90.0.jar" ]; then
             echo "❌ ERROR: deps/imgui-binding-1.90.0.jar not found!"
-            echo "Pastikan folder deps/ sudah di-commit ke repository."
+            echo "Pastikan folder deps/ sudah di-commit ke repository (tidak di .gitignore)."
             exit 1
           fi
           if [ ! -f "deps/imgui-natives.jar" ]; then
             echo "❌ ERROR: deps/imgui-natives.jar not found!"
-            echo "Pastikan folder deps/ sudah di-commit ke repository."
+            echo "Pastikan folder deps/ sudah di-commit ke repository (tidak di .gitignore)."
             exit 1
           fi
           echo "✅ Local deps found!"
 
       - name: Build with Gradle
         run: ./gradlew build --stacktrace
+        env:
+          # Tambah timeout lebih panjang untuk resolve dependencies yang besar (javacv-platform, dll)
+          GRADLE_OPTS: "-Dhttp.socketTimeout=120000 -Dhttp.connectionTimeout=120000 -Dhttps.socketTimeout=120000 -Dhttps.connectionTimeout=120000"
 
-      # Upload hasil remapJar (jar final yang sudah di-remap + shadow)
       - name: Upload mod jar
         uses: actions/upload-artifact@v4
         with:
